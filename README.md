@@ -155,7 +155,7 @@ prepare_inputs = vl_chat_processor(
 inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
 
 # run the model to get the response
-outputs = vl_gpt.language_model.generate(
+outputs = vl_gpt.language.generate(
     inputs_embeds=inputs_embeds,
     attention_mask=prepare_inputs.attention_mask,
     pad_token_id=tokenizer.eos_token_id,

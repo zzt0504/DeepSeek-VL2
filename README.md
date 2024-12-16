@@ -52,6 +52,7 @@
   <a href="https://github.com/deepseek-ai/DeepSeek-VL2/tree/main?tab=readme-ov-file#5-license"><b>📜 License</b></a> |
   <a href="https://github.com/deepseek-ai/DeepSeek-VL2/tree/main?tab=readme-ov-file#6-citation"><b>📖 Citation</b></a> <br>
   <a href="./DeepSeek_VL2_paper.pdf"><b>📄 Paper Link</b></a> |
+  <a href="https://arxiv.org/abs/2412.10302"><b>📄 Arxiv Paper Link</b></a> |
   <a href=""><b>👁️ Demo</b></a>
 </p>
 
@@ -154,7 +155,7 @@ prepare_inputs = vl_chat_processor(
 inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
 
 # run the model to get the response
-outputs = vl_gpt.language_model.generate(
+outputs = vl_gpt.language.generate(
     inputs_embeds=inputs_embeds,
     attention_mask=prepare_inputs.attention_mask,
     pad_token_id=tokenizer.eos_token_id,
@@ -183,11 +184,14 @@ This code repository is licensed under [MIT License](./LICENSE-CODE). The use of
 ## 6. Citation
 
 ```
-
-@misc{wu2024deepseekvl2,
-      title={DeepSeek-VL2: Mixture-of-Experts Vision-Language Models for Advanced Multimodal Understanding},
-      author={Wu, Zhiyu and Chen, Xiaokang and Pan, Zizheng and Liu, Xingchao and Liu, Wen and Dai, Damai and Gao, Huazuo and Ma, Yiyang and Wu, Chengyue and Wang, Bingxuan and Xie, Zhenda and Wu, Yu and Hu, Kai and Wang, Jiawei and Sun, Yaofeng and Li, Yukun and Piao, Yishi and Guan, Kang and Liu, Aixin and Xie, Xin and You, Yuxiang and Dong, Kai and Yu, Xingkai and Zhang, Haowei and Zhao, Liang and Wang, Yisong and Ruan, Chong},
+@misc{wu2024deepseekvl2mixtureofexpertsvisionlanguagemodels,
+      title={DeepSeek-VL2: Mixture-of-Experts Vision-Language Models for Advanced Multimodal Understanding}, 
+      author={Zhiyu Wu and Xiaokang Chen and Zizheng Pan and Xingchao Liu and Wen Liu and Damai Dai and Huazuo Gao and Yiyang Ma and Chengyue Wu and Bingxuan Wang and Zhenda Xie and Yu Wu and Kai Hu and Jiawei Wang and Yaofeng Sun and Yukun Li and Yishi Piao and Kang Guan and Aixin Liu and Xin Xie and Yuxiang You and Kai Dong and Xingkai Yu and Haowei Zhang and Liang Zhao and Yisong Wang and Chong Ruan},
       year={2024},
+      eprint={2412.10302},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2412.10302}, 
 }
 ```
 

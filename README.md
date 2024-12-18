@@ -124,6 +124,23 @@ conversation = [
     {"role": "<|Assistant|>", "content": ""},
 ]
 
+
+# multiple images/interleaved image-text
+conversation_multi_images = [
+    {
+        "role": "<|User|>",
+        "content": "This is image_1: <image>\n"
+                   "This is image_2: <image>\n"
+                   "This is image_3: <image>\n If I am a vegetarian, what can I cook with these ingredients?",
+        "images": [
+            "images/multi_image_1.png",
+            "images/multi_image_2.jpg",
+            "images/multi_image_3.jpg",
+        ],
+    },
+    {"role": "<|Assistant|>", "content": ""}
+]
+
 # load images and prepare for inputs
 pil_images = load_pil_images(conversation)
 prepare_inputs = vl_chat_processor(
@@ -148,7 +165,7 @@ outputs = vl_gpt.language.generate(
     use_cache=True
 )
 
-answer = tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=True)
+answer = tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=False)
 print(f"{prepare_inputs['sft_format'][0]}", answer)
 ```
 

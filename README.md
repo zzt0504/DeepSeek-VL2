@@ -124,24 +124,6 @@ conversation = [
     {"role": "<|Assistant|>", "content": ""},
 ]
 
-## multiple images (or in-context learning) conversation example
-# conversation = [
-#     {
-#         "role": "User",
-#         "content": "<image_placeholder>A dog wearing nothing in the foreground, "
-#                    "<image_placeholder>a dog wearing a santa hat, "
-#                    "<image_placeholder>a dog wearing a wizard outfit, and "
-#                    "<image_placeholder>what's the dog wearing?",
-#         "images": [
-#             "images/dog_a.png",
-#             "images/dog_b.png",
-#             "images/dog_c.png",
-#             "images/dog_d.png",
-#         ],
-#     },
-#     {"role": "Assistant", "content": ""}
-# ]
-
 # load images and prepare for inputs
 pil_images = load_pil_images(conversation)
 prepare_inputs = vl_chat_processor(

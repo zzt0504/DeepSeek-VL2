@@ -17,7 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch DeepSeek model."""
+""" PyTorch DeepSeek model and compatible with both DeepSeekV2 and DeepSeekV3"""
 import math
 import warnings
 from typing import List, Optional, Tuple, Union
@@ -27,16 +27,13 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import torch.distributed as dist
+from einops import repeat
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.modeling_attn_mask_utils import (
-    AttentionMaskConverter,
-    _prepare_4d_attention_mask,
-    _prepare_4d_causal_attention_mask,
-)
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaFlashAttention2
@@ -63,11 +60,9 @@ from transformers.utils.import_utils import is_torch_fx_available
 
 from .configuration_deepseek import DeepseekV2Config
 
-
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
-
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
 # It means that the function will not be traced through and simply appear as a node in the graph.
@@ -76,7 +71,6 @@ if is_torch_fx_available():
         import torch.fx
 
     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
-
 
 logger = logging.get_logger(__name__)
 
@@ -869,17 +863,10 @@ class DeepseekV2Attention(nn.Module):
         compressed_kv, k_pe = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
+        compressed_kv = self.kv_a_layernorm(compressed_kv)
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
-        kv = (
-            self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-            .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            .transpose(1, 2)
-        )
 
-        k_nope, value_states = torch.split(
-            kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )
-        kv_seq_len = value_states.shape[-2]
+        kv_seq_len = k_pe.shape[-2]
         if past_key_value is not None:
             if self.layer_idx is None:
                 raise ValueError(
@@ -888,27 +875,23 @@ class DeepseekV2Attention(nn.Module):
                     "with a layer index."
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
+        cos, sin = self.rotary_emb(q_pe, seq_len=kv_seq_len)
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
 
-        query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
-        query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
-        query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
-
-        key_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
-        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
+            compressed_kv = compressed_kv.unsqueeze(1)
+            k_pe, compressed_kv = past_key_value.update(k_pe, compressed_kv, self.layer_idx, cache_kwargs)
+            compressed_kv = compressed_kv.squeeze(1)
 
-        attn_weights = (
-            torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
-        )
+        kv_b_proj = self.kv_b_proj.weight.view(self.num_heads, -1, self.kv_lora_rank)
+        q_absorb = kv_b_proj[:, :self.qk_nope_head_dim, :]
+        out_absorb = kv_b_proj[:, self.qk_nope_head_dim:, :]
 
+        q_nope = torch.matmul(q_nope, q_absorb)
+        attn_weights = (torch.matmul(q_pe, k_pe.mT) +
+                        torch.matmul(q_nope, compressed_kv.unsqueeze(-3).mT)) * self.softmax_scale
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
@@ -925,11 +908,13 @@ class DeepseekV2Attention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(
             attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
+        ).to(q_pe.dtype)
         attn_weights = nn.functional.dropout(
             attn_weights, p=self.attention_dropout, training=self.training
         )
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv)
+
+        attn_output = torch.matmul(attn_output, out_absorb.mT)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(
@@ -1034,6 +1019,7 @@ class DeepseekV2FlashAttention2(DeepseekV2Attention):
         if self.q_head_dim != self.v_head_dim:
             value_states = F.pad(value_states, [0, self.q_head_dim - self.v_head_dim])
 
+        # TODO: support compressed_kv for kv_cache (instead of key_states, value_states) in flash_attention version
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(
@@ -1494,6 +1480,7 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = (
             output_attentions
@@ -1668,17 +1655,18 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC
     )
     def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+            self,
+            input_ids: torch.LongTensor = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            cache_position: Optional[torch.LongTensor] = None
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1730,6 +1718,7 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cache_position=cache_position
         )
 
         hidden_states = outputs[0]
@@ -1762,13 +1751,14 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        **kwargs,
+            self,
+            input_ids,
+            past_key_values=None,
+            attention_mask=None,
+            inputs_embeds=None,
+            **kwargs,
     ):
+        past_length = 0
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
@@ -1780,13 +1770,10 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
 
             # Keep only the unprocessed tokens:
             # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
-            # some of the inputs are exclusivelly passed as part of the cache (e.g. when passing input_embeds as
+            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
             # input)
-            if (
-                attention_mask is not None
-                and attention_mask.shape[1] > input_ids.shape[1]
-            ):
-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length):]
             # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
             # input_ids based on the past_length.
             elif past_length < input_ids.shape[1]:
@@ -1795,9 +1782,9 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
 
             # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
             if (
-                max_cache_length is not None
-                and attention_mask is not None
-                and cache_length + input_ids.shape[1] > max_cache_length
+                    max_cache_length is not None
+                    and attention_mask is not None
+                    and cache_length + input_ids.shape[1] > max_cache_length
             ):
                 attention_mask = attention_mask[:, -max_cache_length:]
 
@@ -1807,17 +1794,35 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
+                position_ids = position_ids[:, -input_ids.shape[1]:]
+
+        if self.generation_config.cache_implementation == "static":
+            # generation with static cache
+            cache_position = kwargs.get("cache_position", None)
+            if cache_position is None:
+                past_length = 0
+            else:
+                past_length = cache_position[-1] + 1
+            input_ids = input_ids[:, past_length:]
+            position_ids = position_ids[:, past_length:]
+
+        # TODO @gante we should only keep a `cache_position` in generate, and do +=1.
+        # same goes for position ids. Could also help with continued generation.
+        cache_position = torch.arange(past_length, past_length + position_ids.shape[-1], device=position_ids.device)
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
-            model_inputs = {"input_ids": input_ids}
+            # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
+            # recompiles graphs as the stride of the inputs is a guard. Ref: https://github.com/huggingface/transformers/pull/29114
+            # TODO: use `next_tokens` directly instead.
+            model_inputs = {"input_ids": input_ids.contiguous()}
 
         model_inputs.update(
             {
-                "position_ids": position_ids,
+                "position_ids": position_ids.contiguous(),
+                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
@@ -1871,17 +1876,17 @@ class DeepseekV2ForSequenceClassification(DeepseekV2PreTrainedModel):
 
     @add_start_docstrings_to_model_forward(DeepseekV2_INPUTS_DOCSTRING)
     def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+            self,
+            input_ids: torch.LongTensor = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
     ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1921,7 +1926,7 @@ class DeepseekV2ForSequenceClassification(DeepseekV2PreTrainedModel):
         else:
             if input_ids is not None:
                 sequence_lengths = (
-                    torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
+                        torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
                 ).to(logits.device)
             else:
                 sequence_lengths = -1
@@ -1937,7 +1942,7 @@ class DeepseekV2ForSequenceClassification(DeepseekV2PreTrainedModel):
                 if self.num_labels == 1:
                     self.config.problem_type = "regression"
                 elif self.num_labels > 1 and (
-                    labels.dtype == torch.long or labels.dtype == torch.int
+                        labels.dtype == torch.long or labels.dtype == torch.int
                 ):
                     self.config.problem_type = "single_label_classification"
                 else:

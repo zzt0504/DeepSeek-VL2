@@ -242,7 +242,9 @@ def pil_to_base64(
     alt: str = "user upload image",
     resize: bool = True,
     max_size: int = MAX_IMAGE_SIZE,
-    min_size: int = MIN_IMAGE_SIZE
+    min_size: int = MIN_IMAGE_SIZE,
+    format: str = "JPEG",
+    quality: int = 95
 ) -> str:
 
     if resize:
@@ -258,15 +260,16 @@ def pil_to_base64(
         image = image.resize((W, H))
 
     buffered = io.BytesIO()
-    image.save(buffered, format="JPEG")
+    image.save(buffered, format=format, quality=quality)
     img_b64_str = base64.b64encode(buffered.getvalue()).decode()
     img_str = f'<img src="data:image/png;base64,{img_b64_str}" alt="{alt}" />'
 
     return img_str
 
 
-def parse_ref_bbox(response, image):
+def parse_ref_bbox(response, image: Image.Image):
     try:
+        image = image.copy()
         image_h, image_w = image.size
         draw = ImageDraw.Draw(image)
 
@@ -275,7 +278,7 @@ def parse_ref_bbox(response, image):
         assert len(ref) == len(bbox)
 
         if len(ref) == 0:
-            return
+            return None
 
         boxes, labels = [], []
         for box, label in zip(bbox, ref):
@@ -301,9 +304,30 @@ def parse_ref_bbox(response, image):
             text_x = box[0]
             text_y = box[1] - 20
             text_color = box_color
-            font = ImageFont.truetype('./deepseek_vl2/serve/assets/simsun.ttc', size=20)
+            font = ImageFont.truetype("deepseek_vl2/serve/assets/simsun.ttc", size=20)
             draw.text((text_x, text_y), label, font=font, fill=text_color)
 
+        # print(f"boxes = {boxes}, labels = {labels}, re-render = {image}")
         return image
     except:
-        return
+        return None
+
+
+def display_example(image_list):
+    images_html = ""
+    for i, img_path in enumerate(image_list):
+        image = Image.open(img_path)
+        buffered = io.BytesIO()
+        image.save(buffered, format="PNG", quality=100)
+        img_b64_str = base64.b64encode(buffered.getvalue()).decode()
+        img_str = f'<img src="data:image/png;base64,{img_b64_str}" alt="{img_path}" style="height:80px; margin-right: 10px;" />'
+        images_html += img_str
+
+    result_html = f"""
+    <div style="display: flex; align-items: center; margin-bottom: 10px;">
+        <div style="flex: 1; margin-right: 10px;">{images_html}</div>
+    </div>
+    """
+
+    return result_html
+

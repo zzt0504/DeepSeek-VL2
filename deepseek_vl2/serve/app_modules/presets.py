@@ -21,7 +21,7 @@
 import gradio as gr
 
 title = """<h1 align="left" style="min-width:200px; margin-top:0;">Chat with DeepSeek-VL2 </h1>"""
-description_top = """"""
+description_top = """Special Tokens: `<image>`,     Visual Grounding: `<|ref|>{query}<|/ref|>`,    Grounding Conversation: `<|grounding|>{question}`"""
 description = """"""
 CONCURRENT_COUNT = 1
 MAX_EVENTS = 10

@@ -47,24 +47,27 @@ def load_model(model_path, dtype=torch.bfloat16):
 
 def convert_conversation_to_prompts(conversation: Conversation):
     conv_prompts = []
-    pil_images = []
+
+    last_image = None
+
     messages = conversation.messages
     for i in range(0, len(messages), 2):
 
         if isinstance(messages[i][1], tuple):
             text, images = messages[i][1]
+            last_image = images[-1]
         else:
             text, images = messages[i][1], []
-        pil_images.extend(images)
 
         prompt = {
             "role": messages[i][0],
             "content": text,
+            "images": images
         }
         response = {"role": messages[i + 1][0], "content": messages[i + 1][1]}
         conv_prompts.extend([prompt, response])
 
-    return conv_prompts, pil_images
+    return conv_prompts, last_image
 
 
 class StoppingCriteriaSub(StoppingCriteria):
@@ -86,8 +89,7 @@ class StoppingCriteriaSub(StoppingCriteria):
 
 @torch.inference_mode()
 def deepseek_generate(
-    conv_prompts: list,
-    pil_images: list,
+    conversations: list,
     vl_gpt: torch.nn.Module,
     vl_chat_processor: DeepseekVLV2Processor,
     tokenizer: transformers.PreTrainedTokenizer,
@@ -95,11 +97,17 @@ def deepseek_generate(
     max_length: int = 256,
     temperature: float = 1.0,
     top_p: float = 1.0,
-    repetition_penalty=1.1,
+    repetition_penalty: float = 1.1,
+    chunk_size: int = -1
 ):
+    pil_images = []
+    for message in conversations:
+        if "images" not in message:
+            continue
+        pil_images.extend(message["images"])
 
     prepare_inputs = vl_chat_processor.__call__(
-        conversations=conv_prompts,
+        conversations=conversations,
         images=pil_images,
         inference_mode=True,
         force_batchify=True,
@@ -110,11 +118,12 @@ def deepseek_generate(
         vl_gpt,
         tokenizer,
         prepare_inputs,
-        max_length,
-        temperature,
-        repetition_penalty,
-        top_p,
-        stop_words,
+        max_gen_len=max_length,
+        temperature=temperature,
+        repetition_penalty=repetition_penalty,
+        top_p=top_p,
+        stop_words=stop_words,
+        chunk_size=chunk_size
     )
 
 
@@ -128,11 +137,10 @@ def generate(
     repetition_penalty=1.1,
     top_p: float = 0.95,
     stop_words: List[str] = [],
+    chunk_size: int = -1
 ):
     """Stream the text output from the multimodality model with prompt and image inputs."""
-    inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
-
-    streamer = TextIteratorStreamer(tokenizer)
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True)
 
     stop_words_ids = [
         torch.tensor(tokenizer.encode(stop_word)) for stop_word in stop_words
@@ -141,9 +149,27 @@ def generate(
         [StoppingCriteriaSub(stops=stop_words_ids)]
     )
 
+    if chunk_size != -1:
+        inputs_embeds, past_key_values = vl_gpt.incremental_prefilling(
+            input_ids=prepare_inputs.input_ids,
+            images=prepare_inputs.images,
+            images_seq_mask=prepare_inputs.images_seq_mask,
+            images_spatial_crop=prepare_inputs.images_spatial_crop,
+            attention_mask=prepare_inputs.attention_mask,
+            chunk_size=chunk_size
+        )
+    else:
+        inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
+        past_key_values = None
+
     generation_config = dict(
         inputs_embeds=inputs_embeds,
+        input_ids=prepare_inputs.input_ids,
+        images=prepare_inputs.images,
+        images_seq_mask=prepare_inputs.images_seq_mask,
+        images_spatial_crop=prepare_inputs.images_spatial_crop,
         attention_mask=prepare_inputs.attention_mask,
+        past_key_values=past_key_values,
         pad_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,

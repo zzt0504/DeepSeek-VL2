@@ -21,7 +21,6 @@ from argparse import ArgumentParser
 from typing import List, Dict
 import torch
 from transformers import AutoModelForCausalLM
-
 import PIL.Image
 
 from deepseek_vl2.models import DeepseekVLV2ForCausalLM, DeepseekVLV2Processor
@@ -81,14 +80,37 @@ def main(args):
     conversation = [
         {
             "role": "<|User|>",
-            "content": "<image>\n<|ref|>The giraffe at the back.<|/ref|>.",
-            "images": ["./images/visual_grounding.jpeg"],
+            "content": "<image>\n<image>\n<|grounding|>In the first image, an object within the red rectangle is marked. Locate the object of the same category in the second image.",
+            "images": [
+                "images/incontext_visual_grounding_1.jpeg",
+                "images/icl_vg_2.jpeg"
+            ],
         },
         {"role": "<|Assistant|>", "content": ""},
     ]
 
+    # conversation = [
+    #     {
+    #         "role": "<|User|>",
+    #         "content": "<image>\n<|ref|>The giraffe at the back.<|/ref|>.",
+    #         "images": ["./images/visual_grounding_1.jpeg"],
+    #     },
+    #     {"role": "<|Assistant|>", "content": ""},
+    # ]
+
     # load images and prepare for inputs
     pil_images = load_pil_images(conversation)
+    print(f"len(pil_images) = {len(pil_images)}")
+
+    # input_ids = batched_input_ids,
+    # attention_mask = batched_attention_mask,
+    # labels = batched_labels,
+    # images_tiles = batched_images,
+    # images_seq_mask = batched_images_seq_mask,
+    # images_spatial_crop = batched_images_spatial_crop,
+    # sft_format = batched_sft_format,
+    # seq_lens = seq_lens
+
     prepare_inputs = vl_chat_processor.__call__(
         conversations=conversation,
         images=pil_images,
@@ -96,34 +118,59 @@ def main(args):
         system_prompt=""
     ).to(vl_gpt.device, dtype=dtype)
 
+    # for key in prepare_inputs.keys():
+    #     value = prepare_inputs[key]
+    #     if isinstance(value, list):
+    #         print(key, len(value), type(value))
+    #     elif isinstance(value, torch.Tensor):
+    #         print(key, value.shape, type(value))
+
     with torch.no_grad():
         # run image encoder to get the image embeddings
-        inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
+        # inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
+
+        # incremental_prefilling when using 40G GPU for vl2-small
+        inputs_embeds, past_key_values = vl_gpt.incremental_prefilling(
+            input_ids=prepare_inputs.input_ids,
+            images=prepare_inputs.images,
+            images_seq_mask=prepare_inputs.images_seq_mask,
+            images_spatial_crop=prepare_inputs.images_spatial_crop,
+            attention_mask=prepare_inputs.attention_mask,
+            chunk_size=args.chunk_size
+        )
 
         # run the model to get the response
         outputs = vl_gpt.generate(
+            # inputs_embeds=inputs_embeds[:, -1:],
+            # input_ids=prepare_inputs.input_ids[:, -1:],
             inputs_embeds=inputs_embeds,
+            input_ids=prepare_inputs.input_ids,
+            images=prepare_inputs.images,
+            images_seq_mask=prepare_inputs.images_seq_mask,
+            images_spatial_crop=prepare_inputs.images_spatial_crop,
             attention_mask=prepare_inputs.attention_mask,
+            past_key_values=past_key_values,
+
             pad_token_id=tokenizer.eos_token_id,
             bos_token_id=tokenizer.bos_token_id,
             eos_token_id=tokenizer.eos_token_id,
-            max_new_tokens=1024,
+            max_new_tokens=512,
 
-            do_sample=False,
+            # do_sample=False,
             # repetition_penalty=1.1,
 
-            # do_sample=True,
-            # temperature=1.0,
-            # top_p=0.9,
-            # repetition_penalty=1.1,
+            do_sample=True,
+            temperature=0.4,
+            top_p=0.9,
+            repetition_penalty=1.1,
 
             use_cache=True,
         )
 
-        answer = tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=False)
+        answer = tokenizer.decode(outputs[0][len(prepare_inputs.input_ids[0]):].cpu().tolist(), skip_special_tokens=False)
         print(f"{prepare_inputs['sft_format'][0]}", answer)
 
-        vg_image = parse_ref_bbox(answer, image=pil_images[0])
+        vg_image = parse_ref_bbox(answer, image=pil_images[-1])
         if vg_image is not None:
             vg_image.save("./vg.jpg", format="JPEG", quality=85)
 
@@ -131,7 +178,8 @@ def main(args):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True,
-                        default="deepseek-ai/deepseek-vl2-27b-moe",
+                        default="deepseek-ai/deepseek-vl2",
                         help="model name or local path to the model")
+    parser.add_argument("--chunk_size", type=int, default=512, help="chunk size for the model for prefiiling")
     args = parser.parse_args()
     main(args)

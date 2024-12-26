@@ -1,4 +1,8 @@
 from attrdict import AttrDict
+from dataclasses import dataclass
+import logging
+import gc
+
 from einops import rearrange, repeat
 from typing import Optional, List, Tuple, Callable, Union
 
@@ -6,17 +10,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from transformers.utils import (
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+)
+from transformers.modeling_outputs import ModelOutput
 from transformers.configuration_utils import PretrainedConfig
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
-    PreTrainedModel, GenerationConfig, LogitsProcessorList, StoppingCriteriaList,
+    PreTrainedModel
 )
-from transformers.generation.utils import GenerateOutput
+from transformers.utils import logging
 
 from .siglip_vit import VisionTransformer
 from .configuration_deepseek import DeepseekV2Config
 from .modeling_deepseek import DeepseekV2ForCausalLM
+
+
+logger = logging.get_logger(__name__)
 
 
 class MlpProjector(nn.Module):
@@ -181,6 +193,45 @@ class MlpProjectorConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
+@dataclass
+class DeepSeekVLV2CausalLMOutputWithPast(ModelOutput):
+    """
+    Base class for DeepSeek-VL2 causal language model (or autoregressive) outputs.
+
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction).
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+            Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+            `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
+
+            Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
+            `past_key_values` input) to speed up sequential decoding.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+            The rope index difference between sequence length and multimodal rope.
+    """
+
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    past_key_values: Optional[List[torch.FloatTensor]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    rope_deltas: Optional[torch.LongTensor] = None
+
+
 class DeepseekVLV2Config(PretrainedConfig):
     model_type = "deepseek_vl_v2"
     vision_config: VisionEncoderConfig
@@ -228,6 +279,8 @@ class DeepseekVLV2ForCausalLM(DeepseekVLV2PreTrainedModel):
 
     def __init__(self, config: DeepseekVLV2Config):
         super().__init__(config)
+
+        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
 
         # ----------- vision encoder ------------
         vision_config = config.vision_config
@@ -283,8 +336,8 @@ class DeepseekVLV2ForCausalLM(DeepseekVLV2PreTrainedModel):
     def prepare_inputs_embeds(
             self,
             input_ids: torch.LongTensor,
-            images: torch.FloatTensor,
-            images_seq_mask: torch.LongTensor,
+            images: Optional[torch.FloatTensor] = None,
+            images_seq_mask: Optional[torch.LongTensor] = None,
             images_spatial_crop: Optional[torch.LongTensor] = None,
             **ignore_kwargs
     ):
@@ -423,47 +476,221 @@ class DeepseekVLV2ForCausalLM(DeepseekVLV2PreTrainedModel):
 
         return input_embeds
 
-    def generate(
+    @torch.no_grad()
+    def incremental_prefilling(
             self,
-            inputs: Optional[torch.Tensor] = None,
-            generation_config: Optional[GenerationConfig] = None,
-            logits_processor: Optional[LogitsProcessorList] = None,
-            stopping_criteria: Optional[StoppingCriteriaList] = None,
-            prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
-            synced_gpus: Optional[bool] = None,
-            assistant_model: Optional["PreTrainedModel"] = None,
-            streamer: Optional["BaseStreamer"] = None,
-            negative_prompt_ids: Optional[torch.Tensor] = None,
-            negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+
+            images: Optional[torch.FloatTensor] = None,
+            images_seq_mask: Optional[torch.LongTensor] = None,
+            images_spatial_crop: Optional[torch.LongTensor] = None,
+            chunk_size: int = 1024
+    ):
+        if inputs_embeds is None:
+            inputs_embeds = self.prepare_inputs_embeds(
+                input_ids=input_ids,
+                images=images,
+                images_seq_mask=images_seq_mask,
+                images_spatial_crop=images_spatial_crop,
+            )
+
+            del images
+            del images_seq_mask
+            del images_spatial_crop
+
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(inputs_embeds.device)
+
+            self._clear_cuda_cache()
+
+        bzs, seq_len, _ = inputs_embeds.shape
+        past_key_values = None
+
+        # remain the last token for the next forward
+        prefilling_len = seq_len - 1
+        for i in range(0, prefilling_len, chunk_size):
+            chunk_start = i
+            chunk_end = min(i + chunk_size, prefilling_len)
+            chunk_inputs_embeds = inputs_embeds[:, chunk_start: chunk_end]
+            chunk_attention_mask = attention_mask[:, 0: chunk_end]
+            # print(f"start = {chunk_start}, end = {chunk_end}, prefilling_len = {prefilling_len}, seq_len = {seq_len}")
+
+            # compute position_ids
+            if past_key_values is not None:
+                position_ids = torch.arange(
+                    chunk_start,
+                    chunk_end,
+                    dtype=torch.long,
+                    device=inputs_embeds.device
+                ).unsqueeze(0)
+                past_key_values = self._move_past_key_values_to_gpu(past_key_values, inputs_embeds.device)
+            else:
+                position_ids = None
+
+            # chunk-forward
+            with torch.no_grad():
+                outputs = self.forward(
+                    inputs_embeds=chunk_inputs_embeds,
+                    attention_mask=chunk_attention_mask,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                    use_cache=True,
+                )
+                # update past_key_values
+                past_key_values = outputs.past_key_values
+                past_key_values = self._move_past_key_values_to_cpu(past_key_values)
+
+                del outputs, position_ids
+                self._clear_cuda_cache()
+
+        prefilling_key_values = []
+        for layer_past in past_key_values:
+            prefilling_key_values.append(
+                (
+                    layer_past[0][:, :, 0: prefilling_len, ...].to(inputs_embeds.device),
+                    layer_past[1][:, :, 0: prefilling_len, ...].to(inputs_embeds.device),
+                )
+            )
+
+        return inputs_embeds, prefilling_key_values
+
+    def forward(
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+
+            images: Optional[torch.FloatTensor] = None,
+            images_seq_mask: Optional[torch.LongTensor] = None,
+            images_spatial_crop: Optional[torch.LongTensor] = None,
+
+            labels: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+    ):
+
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+        if inputs_embeds is None:
+            inputs_embeds = self.prepare_inputs_embeds(
+                input_ids=input_ids,
+                images=images,
+                images_seq_mask=images_seq_mask,
+                images_spatial_crop=images_spatial_crop,
+            )
+
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(inputs_embeds.device)
+
+        # print(inputs_embeds.shape)
+        outputs = self.language.forward(
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position
+        )
+
+        self._clear_cuda_cache()
+
+        return outputs
+
+    def _clear_cuda_cache(self):
+        """clear CUDA memory cache"""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+    def _move_past_key_values_to_cpu(self, past_key_values):
+        # print(f"past_key_values -> cpu")
+        if past_key_values is None:
+            return None
+        return tuple(tuple(t.cpu() for t in layer) for layer in past_key_values)
+
+    def _move_past_key_values_to_gpu(self, past_key_values, device="cuda:0"):
+        # print(f"past_key_values -> gpu")
+        if past_key_values is None:
+            return None
+        return tuple(tuple(t.to(device) for t in layer) for layer in past_key_values)
+
+    def prepare_inputs_for_generation(
+            self,
+            input_ids,
+            past_key_values=None,
+            inputs_embeds=None,
+
+            images: Optional[torch.FloatTensor] = None,
+            images_seq_mask: Optional[torch.LongTensor] = None,
+            images_spatial_crop: Optional[torch.LongTensor] = None,
+
+            attention_mask=None,
+            cache_position=None,
+
+            pixel_values=None,
+            image_sizes=None,
+            num_logits_to_keep=None,
             **kwargs,
-    ) -> Union[GenerateOutput, torch.LongTensor]:
-        r"""
-        Generates sequences for models with a language modeling head. The method currently supports greedy decoding,
-        beam-search decoding, sampling with temperature, sampling with top-k or nucleus sampling. Beam-search decoding
-        is controlled by the `num_beams` parameter and the `num_return_sequences` parameter.
-
-        Parameters:
-            - `inputs` (optional) -- `torch.LongTensor` of shape `(batch, sequence_length)`:
-                The sequence used as a prompt for the generation. If `None`, generate for the model's prompt.
-            - `generation_config` (optional) -- `GenerationConfig`:
-                The generation config of the model.
-            - `logits_processor` (optional) -- `LogitsProcessorList`:
-                A list of instances of :class:`~transform
-        """
-
-        return self.language.generate(
-            inputs=inputs,
-            generation_config=generation_config,
-            logits_processor=logits_processor,
-            stopping_criteria=stopping_criteria,
-            prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
-            synced_gpus=synced_gpus,
-            assistant_model=assistant_model,
-            streamer=streamer,
-            negative_prompt_ids=negative_prompt_ids,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
+    ):
+        # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
+        model_inputs = self.language.prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            num_logits_to_keep=num_logits_to_keep,
             **kwargs,
         )
+
+        # If we're in cached decoding stage, pixel values should be None because input ids do not contain special image token anymore
+        # Otherwise we need pixel values to be passed to model
+        cache_position = model_inputs["cache_position"]
+        if cache_position[0] == 0:
+            model_inputs["images"] = images
+            model_inputs["images_seq_mask"] = images_seq_mask
+            model_inputs["images_spatial_crop"] = images_spatial_crop
+
+        return model_inputs
+
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (
+                tuple(
+                    past_state.index_select(0, beam_idx.to(past_state.device))
+                    for past_state in layer_past
+                ),
+            )
+        return reordered_past
 
 
 AutoConfig.register("vision", VisionEncoderConfig)

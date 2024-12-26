@@ -70,6 +70,7 @@ Zhiyu Wu*, Xiaokang Chen*, Zizheng Pan*, Xingchao Liu*, Wen Liu**, Damai Dai, Hu
 
 ## 2. Release
 ✅ <b>2024-12-25</b>: Gradio Demo Example, Incremental Prefilling and VLMEvalKit Support.
+
 ✅ <b>2024-12-13</b>: DeepSeek-VL2 family released, including <code>DeepSeek-VL2-tiny</code>, <code>DeepSeek-VL2-small</code>, <code>DeepSeek-VL2</code>.
 
 ## 3. Model Download

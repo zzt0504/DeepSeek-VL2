@@ -618,8 +618,6 @@ class DeepseekVLV2ForCausalLM(DeepseekVLV2PreTrainedModel):
             cache_position=cache_position
         )
 
-        self._clear_cuda_cache()
-
         return outputs
 
     def _clear_cuda_cache(self):

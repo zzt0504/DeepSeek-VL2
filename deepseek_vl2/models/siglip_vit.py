@@ -139,7 +139,7 @@ class Attention(nn.Module):
 
         if not self.qk_norm:
             if self.head_dim % 32 == 0 and is_flash_attn_2_available():
-                # flashattn的head_dim必须是32的倍数，SigLIP-SO400M无法使用flashattn
+                # flashattn must have head_dim as a multiple of 32
                 x = flash_attn_qkvpacked_func(qkv, dropout_p=self.attn_drop.p if self.training else 0.,
                                               deterministic=self.deterministic)
             else:
